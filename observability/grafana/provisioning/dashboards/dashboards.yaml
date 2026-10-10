@@ -1,0 +1,11 @@
+apiVersion: 1
+
+providers:
+  - name: aiobs
+    folder: AI Kubernetes Observability
+    type: file
+    disableDeletion: true
+    allowUiUpdates: false
+    updateIntervalSeconds: 10
+    options:
+      path: /var/lib/grafana/dashboards

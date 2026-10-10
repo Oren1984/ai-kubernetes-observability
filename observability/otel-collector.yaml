@@ -1,0 +1,199 @@
+# OpenTelemetry Collector - the single owner of every telemetry pipeline.
+# Runs inside the cluster (kubernetes/otel-collector.yaml mounts this file)
+# and exports to the Compose backends over the shared `kind` Docker network.
+
+receivers:
+  # Application telemetry pushed by the OpenTelemetry SDKs.
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+      grpc:
+        endpoint: 0.0.0.0:4317
+
+  # Container / pod resource usage from the node's kubelet.
+  kubelet_stats:
+    collection_interval: 5s
+    auth_type: serviceAccount
+    endpoint: https://${env:K8S_NODE_IP}:10250
+    insecure_skip_verify: true # kind's kubelet serving cert is self-signed
+    metric_groups: [pod, container]
+    metrics:
+      k8s.container.memory_limit_utilization:
+        enabled: true
+      k8s.container.cpu_limit_utilization:
+        enabled: true
+
+  # Workload state: deployment availability, container readiness, restarts,
+  # resource requests and limits.
+  k8s_cluster:
+    collection_interval: 5s
+    auth_type: serviceAccount
+    resource_attributes:
+      # Why the previous container instance died (e.g. OOMKilled).
+      k8s.container.status.last_terminated_reason:
+        enabled: true
+
+  # Kubernetes events of the demo namespace, shipped as logs.
+  k8s_objects:
+    auth_type: serviceAccount
+    objects:
+      - name: events
+        mode: watch
+        namespaces: [aiobs-demo]
+
+  # The Collector's own throughput counters (used for the FinOps estimates).
+  prometheus/self:
+    config:
+      scrape_configs:
+        - job_name: otel-collector
+          scrape_interval: 15s
+          static_configs:
+            - targets: ["localhost:8888"]
+
+processors:
+  # Bounded memory: refuse data before the container limit is reached.
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 240
+    spike_limit_mib: 60
+
+  # Kubernetes context for everything that arrives from a pod.
+  k8s_attributes:
+    auth_type: serviceAccount
+    extract:
+      metadata:
+        - k8s.namespace.name
+        - k8s.pod.name
+        - k8s.pod.uid
+        - k8s.pod.start_time
+        - k8s.deployment.name
+        - k8s.node.name
+    pod_association:
+      - sources:
+          - from: resource_attribute
+            name: k8s.pod.uid
+      - sources:
+          - from: resource_attribute
+            name: k8s.pod.name
+          - from: resource_attribute
+            name: k8s.namespace.name
+      - sources:
+          - from: connection
+
+  resource:
+    attributes:
+      - key: k8s.cluster.name
+        value: aiobs
+        action: upsert
+      - key: deployment.environment.name
+        value: local
+        action: upsert
+
+  resource/k8s-events:
+    attributes:
+      - key: service.name
+        value: kubernetes-events
+        action: upsert
+      - key: k8s.namespace.name
+        value: aiobs-demo
+        action: upsert
+
+  # Probe requests are noise in the trace store.
+  filter/probes:
+    error_mode: ignore
+    traces:
+      span:
+        - 'attributes["http.route"] == "/health"'
+        - 'attributes["http.route"] == "/ready"'
+        - 'IsMatch(name, "^GET /(health|ready)( http (send|receive))?$")'
+
+  # Keep only the project's namespaces from the cluster-wide receivers.
+  filter/system-namespaces:
+    error_mode: ignore
+    metrics:
+      metric:
+        - 'resource.attributes["k8s.namespace.name"] == "kube-system"'
+        - 'resource.attributes["k8s.namespace.name"] == "local-path-storage"'
+        - 'resource.attributes["k8s.namespace.name"] == "kube-node-lease"'
+        - 'resource.attributes["k8s.namespace.name"] == "kube-public"'
+        - 'resource.attributes["k8s.namespace.name"] == "default"'
+
+  # Defence in depth: the app redacts too, but logs are untrusted input.
+  transform/redact:
+    error_mode: ignore
+    log_statements:
+      - context: log
+        conditions:
+          - IsString(log.body)
+        statements:
+          - replace_pattern(log.body, "(?i)\\b(password|passwd|secret|token|api[_-]?key|authorization)\\b(\\s*[=:]\\s*)(\\S+)", "$$1$$2[REDACTED]")
+
+  batch:
+    timeout: 2s
+    send_batch_size: 512
+    send_batch_max_size: 1024
+
+exporters:
+  # Prometheus native OTLP receiver.
+  otlp_http/prometheus:
+    endpoint: http://aiobs-prometheus:9090/api/v1/otlp
+    tls:
+      insecure: true
+    sending_queue:
+      queue_size: 200
+    retry_on_failure:
+      max_elapsed_time: 60s
+
+  # Loki native OTLP endpoint.
+  otlp_http/loki:
+    endpoint: http://aiobs-loki:3100/otlp
+    tls:
+      insecure: true
+    sending_queue:
+      queue_size: 200
+    retry_on_failure:
+      max_elapsed_time: 60s
+
+  # Tempo OTLP gRPC.
+  otlp_grpc/tempo:
+    endpoint: aiobs-tempo:4317
+    tls:
+      insecure: true
+    sending_queue:
+      queue_size: 200
+    retry_on_failure:
+      max_elapsed_time: 60s
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+service:
+  extensions: [health_check]
+  telemetry:
+    metrics:
+      level: normal
+      readers:
+        - pull:
+            exporter:
+              prometheus:
+                host: 0.0.0.0
+                port: 8888
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, filter/probes, k8s_attributes, resource, batch]
+      exporters: [otlp_grpc/tempo]
+    metrics:
+      receivers: [otlp, kubelet_stats, k8s_cluster, prometheus/self]
+      processors: [memory_limiter, k8s_attributes, filter/system-namespaces, resource, batch]
+      exporters: [otlp_http/prometheus]
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, k8s_attributes, transform/redact, resource, batch]
+      exporters: [otlp_http/loki]
+    logs/k8s-events:
+      receivers: [k8s_objects]
+      processors: [memory_limiter, resource/k8s-events, resource, batch]
+      exporters: [otlp_http/loki]

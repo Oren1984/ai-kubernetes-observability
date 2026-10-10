@@ -1,0 +1,17 @@
+# Local tooling and runtime state (kubeconfig, service-account token, SQLite)
+.tools/
+.runtime/
+data/
+.env
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Terraform
+terraform/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan

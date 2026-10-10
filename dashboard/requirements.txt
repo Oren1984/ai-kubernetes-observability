@@ -1,0 +1,7 @@
+streamlit==1.65.0
+httpx==0.28.1
+pydantic==2.14.0
+pandas==3.0.6
+# Lets the integration and E2E suites run inside this image, on the cluster's
+# Docker network (see the `tests` service in docker-compose.yml).
+pytest==9.1.1

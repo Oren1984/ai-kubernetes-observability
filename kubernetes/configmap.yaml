@@ -1,0 +1,11 @@
+# Shared OpenTelemetry settings for every workload in the demo namespace.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: otel-env
+  namespace: aiobs-demo
+data:
+  OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector.aiobs-observability.svc.cluster.local:4318"
+  OTEL_EXPORTER_OTLP_PROTOCOL: "http/protobuf"
+  # Emit the stable HTTP semantic conventions (http.server.request.duration, seconds).
+  OTEL_SEMCONV_STABILITY_OPT_IN: "http"

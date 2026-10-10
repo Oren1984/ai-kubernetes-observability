@@ -1,0 +1,8 @@
+.git
+.venv
+.tools
+.runtime
+data
+docs
+terraform
+**/__pycache__

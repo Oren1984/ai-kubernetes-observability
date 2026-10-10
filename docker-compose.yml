@@ -1,0 +1,132 @@
+# Supporting services for the Kubernetes workload: telemetry backends, Grafana
+# and the incident-intelligence dashboard. The application itself runs in the
+# kind cluster, never here.
+#
+# All services join the `kind` Docker network (created by `kind create cluster`)
+# so the in-cluster OpenTelemetry Collector can reach them by container name.
+# Every published port is bound to 127.0.0.1.
+name: aiobs
+
+services:
+  prometheus:
+    image: prom/prometheus:v3.15.0
+    container_name: aiobs-prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yaml
+      - --web.enable-otlp-receiver
+      - --storage.tsdb.retention.time=24h
+      - --storage.tsdb.path=/prometheus
+    volumes:
+      - ./observability/prometheus.yaml:/etc/prometheus/prometheus.yaml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "127.0.0.1:19090:9090"
+    networks: [kind]
+    mem_limit: 512m
+    restart: unless-stopped
+
+  loki:
+    image: grafana/loki:3.7.8
+    container_name: aiobs-loki
+    command: ["-config.file=/etc/loki/loki.yaml"]
+    volumes:
+      - ./observability/loki.yaml:/etc/loki/loki.yaml:ro
+      - loki-data:/loki
+    ports:
+      - "127.0.0.1:13100:3100"
+    networks: [kind]
+    mem_limit: 512m
+    restart: unless-stopped
+
+  tempo:
+    image: grafana/tempo:2.10.8
+    container_name: aiobs-tempo
+    command: ["-config.file=/etc/tempo/tempo.yaml"]
+    volumes:
+      - ./observability/tempo.yaml:/etc/tempo/tempo.yaml:ro
+      - tempo-data:/var/tempo
+    ports:
+      - "127.0.0.1:13200:3200"
+    networks: [kind]
+    mem_limit: 512m
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:13.2.3
+    container_name: aiobs-grafana
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?set GRAFANA_ADMIN_PASSWORD in .env}
+      # Read-only anonymous access for the local demo; editing requires login.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_USERS_DEFAULT_THEME: dark
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "127.0.0.1:13000:3000"
+    networks: [kind]
+    mem_limit: 512m
+    depends_on: [prometheus, loki, tempo]
+    restart: unless-stopped
+
+  dashboard:
+    build:
+      context: .
+      dockerfile: dashboard/Dockerfile
+    image: aiobs/incident-dashboard:dev
+    container_name: aiobs-dashboard
+    environment: &engine-env
+      PROMETHEUS_URL: http://aiobs-prometheus:9090
+      LOKI_URL: http://aiobs-loki:3100
+      TEMPO_URL: http://aiobs-tempo:3200
+      GRAFANA_URL: http://aiobs-grafana:3000
+      GRAFANA_PUBLIC_URL: http://localhost:13000
+      DEMO_API_URL: http://aiobs-control-plane:30080
+      K8S_API_URL: https://aiobs-control-plane:6443
+      K8S_CREDENTIALS_DIR: /var/run/aiobs-k8s
+      AUDIT_DB_PATH: /data/incidents.db
+      LLM_PROVIDER: ${LLM_PROVIDER:-mock}
+      LLM_BASE_URL: ${LLM_BASE_URL:-}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_MODEL: ${LLM_MODEL:-}
+    volumes:
+      # Read-only service-account token + cluster CA written by scripts/start.ps1.
+      - ./.runtime/k8s:/var/run/aiobs-k8s:ro
+      - ./data:/data
+    ports:
+      - "127.0.0.1:18501:8501"
+    networks: [kind]
+    mem_limit: 512m
+    restart: unless-stopped
+
+  # Integration and E2E suites, run on the cluster's network:
+  #   docker compose --profile test run --rm tests
+  tests:
+    image: aiobs/incident-dashboard:dev
+    profiles: [test]
+    environment:
+      <<: *engine-env
+      AUDIT_DB_PATH: /tmp/test-incidents.db
+      LLM_PROVIDER: mock
+      PYTHONPATH: /repo # test the working tree, not the copy baked into the image
+    working_dir: /repo
+    volumes:
+      - ./:/repo:ro
+      - ./.runtime/k8s:/var/run/aiobs-k8s:ro
+    command: ["python", "-m", "pytest", "-p", "no:cacheprovider", "tests/integration", "tests/e2e", "-v"]
+    networks: [kind]
+
+networks:
+  kind:
+    external: true
+
+volumes:
+  prometheus-data:
+  loki-data:
+  tempo-data:
+  grafana-data:

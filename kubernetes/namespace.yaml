@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: aiobs-demo
+  labels:
+    app.kubernetes.io/part-of: ai-kubernetes-observability
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: aiobs-observability
+  labels:
+    app.kubernetes.io/part-of: ai-kubernetes-observability
