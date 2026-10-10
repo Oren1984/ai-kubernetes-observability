@@ -15,7 +15,7 @@ import httpx
 
 from .config import Settings
 from .correlation import detect_symptoms
-from .sanitize import sanitize_text
+from .sanitize import is_trace_id, safe_label, sanitize_text
 from .schemas import EvidenceItem, IncidentEvidence, MissingEvidence, TimeWindow
 
 RATE_WINDOW = "30s"
@@ -142,7 +142,7 @@ class EvidenceCollector:
         response = self.http.get(f"{self.s.prometheus_url}/api/v1/query",
                                  params={"query": expr, "time": ev.time_window.end.timestamp()})
         response.raise_for_status()
-        reasons = sorted({r["metric"].get(label, "") for r in response.json()["data"]["result"]} - {""})
+        reasons = sorted({safe_label(r["metric"].get(label, "")) for r in response.json()["data"]["result"]} - {""})
         if reasons:
             ev.metrics.append(EvidenceItem(
                 id="M-last_terminated_reason", source="prometheus", title="Last container termination reason",
@@ -162,7 +162,9 @@ class EvidenceCollector:
                 "q": traceql, "limit": self.s.max_traces,
                 "start": int(ev.time_window.start.timestamp()), "end": int(ev.time_window.end.timestamp()) + 1})
             response.raise_for_status()
-            traces = sorted(response.json().get("traces") or [], key=lambda t: t.get("durationMs", 0), reverse=True)
+            # Ids are reused in Tempo and Loki queries, so only well-formed ones are accepted.
+            traces = sorted((t for t in response.json().get("traces") or [] if is_trace_id(t.get("traceID"))),
+                            key=lambda t: t.get("durationMs", 0), reverse=True)
             if not traces:
                 continue  # absence of slow/error traces is a valid observation, not missing data
             exemplar_id = traces[0]["traceID"]
@@ -217,13 +219,13 @@ class EvidenceCollector:
                     exc_message = exc_message or attrs.get("exception.message")
         server_ms = server["_ms"] if server else 0.0
         return {
-            "span_count": len(spans), "services": sorted(s for s in services if s),
+            "span_count": len(spans), "services": sorted(safe_label(s) for s in services if s),
             "server_ms": round(server_ms, 1),
-            "dominant_span": dominant["name"] if dominant else None,
+            "dominant_span": safe_label(dominant["name"]) if dominant else None,
             "dominant_ms": round(dominant["_ms"], 1) if dominant else 0.0,
             "dominant_share_pct": round(100 * dominant["_ms"] / server_ms, 1) if dominant and server_ms else 0.0,
-            "error_span": failed["name"] if failed else None,
-            "exception_type": sanitize_text(exc_type, 80) if exc_type else None,
+            "error_span": safe_label(failed["name"]) if failed else None,
+            "exception_type": safe_label(exc_type) if exc_type else None,
             "exception_message": sanitize_text(exc_message) if exc_message else None,
         }
 
@@ -239,17 +241,18 @@ class EvidenceCollector:
         response = self.http.get(f"{self.s.loki_url}/loki/api/v1/query",
                                  params={"query": count_query, "time": int(end.timestamp() * 1e9)})
         response.raise_for_status()
-        counts = {(r["metric"].get("severity_text", "?"), r["metric"].get("event", "other")): int(float(r["value"][1]))
+        counts = {(safe_label(r["metric"].get("severity_text", "?"), 16), safe_label(r["metric"].get("event", "other"), 48)):
+                  int(float(r["value"][1]))
                   for r in response.json()["data"]["result"]}
 
         groups: dict[tuple, dict] = {}
         for labels, ts, line in self._loki_lines(selector, start, end):
-            key = (labels.get("severity_text", "?"), labels.get("event", "other"))
+            key = (safe_label(labels.get("severity_text", "?"), 16), safe_label(labels.get("event", "other"), 48))
             group = groups.setdefault(key, {"lines": [], "trace_ids": [], "first_ns": ts})
             if len(group["lines"]) < 3:
                 group["lines"].append(sanitize_text(line))
             trace_id = labels.get("trace_id")
-            if trace_id and trace_id not in group["trace_ids"] and len(group["trace_ids"]) < 20:
+            if is_trace_id(trace_id) and trace_id not in group["trace_ids"] and len(group["trace_ids"]) < 20:
                 group["trace_ids"].append(trace_id)
         for key in sorted(set(counts) | set(groups)):
             severity, event = key
@@ -279,7 +282,7 @@ class EvidenceCollector:
                 observation=f"{len(lines)} log records carry trace id {trace_id}, linking them to {trace_item.id}",
                 value=float(len(lines)), unit="records", query=query, link=self._explore("loki", {"expr": query}, ev),
                 attributes={"count": len(lines), "trace_id": trace_id, "linked_trace_evidence": trace_item.id,
-                            "severities": sorted({l[0].get("severity_text", "?") for l in lines})},
+                            "severities": sorted({safe_label(l[0].get("severity_text", "?"), 16) for l in lines})},
                 untrusted_text=[sanitize_text(line) for _, _, line in lines[:3]],
             ))
 
@@ -327,12 +330,13 @@ class EvidenceCollector:
         pods_path = f"/api/v1/namespaces/{ns}/pods"
         pods = self._k8s_get(pods_path, labelSelector=f"app={self.s.service}")
         for pod in pods.get("items", []):
-            name = pod["metadata"]["name"]
+            name = safe_label(pod["metadata"]["name"])
             for status in pod.get("status", {}).get("containerStatuses", []):
+                container = safe_label(status["name"])
                 ev.kubernetes_events.append(EvidenceItem(
                     id=f"K-status-{name}", source="kubernetes", title=f"Pod {name} container status",
-                    observation=(f"Container '{status['name']}' in pod {name}: ready={status['ready']}, "
-                                 f"restartCount={status['restartCount']}"),
+                    observation=(f"Container '{container}' in pod {name}: ready={bool(status['ready'])}, "
+                                 f"restartCount={int(status['restartCount'])}"),
                     value=float(status["restartCount"]), unit="restarts",
                     query=f"GET {pods_path}?labelSelector=app={self.s.service}",
                     attributes={"pod": name, "ready": status["ready"], "restart_count": status["restartCount"]},
@@ -340,14 +344,15 @@ class EvidenceCollector:
                 terminated = status.get("lastState", {}).get("terminated")
                 finished = _parse_time(terminated.get("finishedAt")) if terminated else None
                 if finished and lo <= finished <= hi:
+                    reason = safe_label(terminated.get("reason"))
+                    exit_code = terminated.get("exitCode") if isinstance(terminated.get("exitCode"), int) else None
                     ev.kubernetes_events.append(EvidenceItem(
                         id=f"K-terminated-{name}", source="kubernetes", title=f"Pod {name} container terminated",
-                        observation=(f"Container '{status['name']}' in pod {name} was terminated at "
-                                     f"{finished.isoformat()} with reason {terminated.get('reason')} "
-                                     f"(exit code {terminated.get('exitCode')})"),
+                        observation=(f"Container '{container}' in pod {name} was terminated at "
+                                     f"{finished.isoformat()} with reason {reason} (exit code {exit_code})"),
                         query=f"GET {pods_path}?labelSelector=app={self.s.service}",
-                        attributes={"pod": name, "reason": terminated.get("reason"),
-                                    "exit_code": terminated.get("exitCode"), "finished_at": finished.isoformat()},
+                        attributes={"pod": name, "reason": reason, "exit_code": exit_code,
+                                    "finished_at": finished.isoformat()},
                     ))
         events_path = f"/api/v1/namespaces/{ns}/events"
         grouped: dict[str, dict] = {}
@@ -356,8 +361,8 @@ class EvidenceCollector:
             involved = event.get("involvedObject", {}).get("name", "")
             if not when or not (lo <= when <= hi) or not involved.startswith(self.s.service):
                 continue
-            group = grouped.setdefault(event.get("reason", "Unknown"),
-                                       {"count": 0, "type": event.get("type"), "messages": []})
+            group = grouped.setdefault(safe_label(event.get("reason", "Unknown"), 48),
+                                       {"count": 0, "type": safe_label(event.get("type"), 16), "messages": []})
             group["count"] += int(event.get("count") or 1)
             if len(group["messages"]) < 2:
                 group["messages"].append(sanitize_text(event.get("message", "")))

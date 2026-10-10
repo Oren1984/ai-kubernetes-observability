@@ -31,10 +31,32 @@ def sanitize_text(text: str, max_len: int = MAX_TEXT_LEN) -> str:
     return text if len(text) <= max_len else text[:max_len] + "…[truncated]"
 
 
+_LABEL_UNSAFE = re.compile(r"[^A-Za-z0-9_.:/ -]")
+_TRACE_ID = re.compile(r"^[0-9a-f]{16,32}$")
+_MARKDOWN_SPECIAL = re.compile(r"([\\`*_\[\]()<>#!|~$])")
+
+
+def safe_label(value, max_len: int = 80) -> str:
+    """Identifier-like telemetry fields (span names, exception types, event
+    reasons, log `event` attributes) are also written by the workload. They are
+    reduced to a plain character set so they cannot carry prose, markup or
+    query syntax into observations, evidence ids or backend queries."""
+    return _LABEL_UNSAFE.sub("_", str(value))[:max_len]
+
+
+def is_trace_id(value) -> bool:
+    return isinstance(value, str) and bool(_TRACE_ID.match(value))
+
+
+def escape_markdown(text) -> str:
+    """Render text literally in a Markdown view: no links, images or formatting."""
+    return _MARKDOWN_SPECIAL.sub(r"\\\1", str(text))
+
+
 def looks_like_injection(text: str) -> bool:
     return bool(_INJECTION.search(text))
 
 
-def neutralize_for_llm(text: str) -> str:
+def neutralize_for_llm(text: str, max_len: int = MAX_TEXT_LEN) -> str:
     """What an LLM is allowed to see of an untrusted string."""
-    return INJECTION_PLACEHOLDER if looks_like_injection(text) else sanitize_text(text)
+    return INJECTION_PLACEHOLDER if looks_like_injection(text) else sanitize_text(text, max_len)

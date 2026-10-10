@@ -15,6 +15,7 @@ from intelligence.analysis_engine import AnalysisEngine, investigate_and_record
 from intelligence.audit import AuditStore, ReviewError
 from intelligence.config import load_settings
 from intelligence.scenarios import SCENARIOS, ScenarioError, ScenarioRunner
+from intelligence.sanitize import escape_markdown as esc
 from intelligence.schemas import utcnow
 
 st.set_page_config(page_title="Incident Intelligence", page_icon="🛰️", layout="wide")
@@ -222,8 +223,8 @@ def page_investigation():
 
     st.subheader("Finding")
     left, right = st.columns([3, 1])
-    left.markdown(f"**Probable root cause**  {INFERRED}  \n### {result.probable_root_cause}")
-    left.write(result.summary)
+    left.markdown(f"**Probable root cause**  {INFERRED}  \n### {esc(result.probable_root_cause)}")
+    left.markdown(esc(result.summary))
     right.metric("Evidence-support score", f"{result.confidence:.2f}")
     right.progress(min(result.confidence, 1.0))
     right.caption("Share of the expected evidence pattern that was observed. Not a calibrated probability.")
@@ -231,7 +232,7 @@ def page_investigation():
             "rejected": "narrative REJECTED by validation — rule-based output shown"}[result.llm_status]
     st.caption(f"Analysis mode `{result.analysis_mode}` · LLM narrative: {mode} · analysed {fmt_time(result.created_at.isoformat())}")
     if result.llm_rejection_reasons:
-        st.error("LLM output rejected: " + "; ".join(result.llm_rejection_reasons))
+        st.error("LLM output rejected: " + esc("; ".join(result.llm_rejection_reasons)))
     with st.expander("How the score was calculated"):
         st.text(result.confidence_explanation)
 
@@ -239,27 +240,27 @@ def page_investigation():
     with col_obs:
         st.markdown(f"#### {OBSERVED} Confirmed by telemetry")
         for line in result.observed or ["Nothing relevant was observed."]:
-            st.markdown(f"- {line}")
+            st.markdown(f"- {esc(line)}")
         if evidence.symptoms:
             st.caption("Symptoms detected: " + ", ".join(s.replace("_", " ") for s in evidence.symptoms))
     with col_inf:
         st.markdown(f"#### {INFERRED} Analytical inference")
         for line in result.inferred or ["No inference was drawn."]:
-            st.markdown(f"- {line}")
+            st.markdown(f"- {esc(line)}")
         if result.alternative_hypotheses:
             st.markdown("**Alternative explanations considered**")
             for alt in result.alternative_hypotheses:
-                st.markdown(f"- {alt.title} — score {alt.score:.2f}" + (f"  \n  :gray[{alt.note}]" if alt.note else ""))
+                st.markdown(f"- {esc(alt.title)} — score {alt.score:.2f}" + (f"  \n  {esc(alt.note)}" if alt.note else ""))
 
     st.markdown(f"#### {RECOMMENDED} Next steps for a human")
     for rec in result.recommendations or []:
-        st.markdown(f"- **{rec.kind}** · {rec.text}" + ("  :gray[(suggested by LLM)]" if rec.source == "llm" else ""))
+        st.markdown(f"- **{rec.kind}** · {esc(rec.text)}" + ("  :gray[(suggested by LLM)]" if rec.source == "llm" else ""))
     st.caption("Recommendations are advisory. Decide on them under **Review & audit**; nothing is executed by this system.")
 
     if result.missing_information:
         st.markdown("#### Missing information")
         for line in result.missing_information:
-            st.markdown(f"- ⚠️ {line}")
+            st.markdown(f"- ⚠️ {esc(line)}")
 
     st.subheader("Evidence")
     st.caption("Every item is a query result from a live backend. Items cited by the finding are marked ●.")
@@ -270,8 +271,9 @@ def page_investigation():
                 st.error("Source unavailable during collection — no evidence was substituted.")
             for item in items:
                 cited = "●" if item.id in result.supporting_evidence_ids else "○"
-                st.markdown(f"{cited} `{item.id}` — {item.observation}" + (f"  [open in Grafana]({item.link})" if item.link else ""))
-                st.caption(f"Query: `{item.query}`")
+                st.markdown(f"{cited} **{esc(item.id)}** — {esc(item.observation)}"
+                            + (f"  [open in Grafana]({item.link})" if item.link else ""))
+                st.code(item.query, language=None, wrap_lines=True)
                 for text in item.untrusted_text:
                     st.code(text, language=None, wrap_lines=True)
 
@@ -291,7 +293,7 @@ def page_review():
     st.session_state["reviewer"] = reviewer
     for rec in recommendations:
         with st.container(border=True):
-            st.markdown(f"**#{rec['id']} · {rec['kind']}** — {rec['text']}")
+            st.markdown(f"**#{rec['id']} · {rec['kind']}** — {esc(rec['text'])}")
             if rec["status"] == "pending":
                 note = st.text_input("Decision note", key=f"note-{rec['id']}", placeholder="Why approve or reject?")
                 a, b, _ = st.columns([1, 1, 4])
@@ -304,8 +306,8 @@ def page_review():
                             st.error(str(exc))
             else:
                 icon = "✅" if rec["status"] == "approved" else "🚫"
-                st.markdown(f"{icon} **{rec['status'].upper()}** by {rec['reviewer']} at {fmt_time(rec['decided_at'])}"
-                            + (f" — “{rec['note']}”" if rec["note"] else ""))
+                st.markdown(f"{icon} **{rec['status'].upper()}** by {esc(rec['reviewer'])} at {fmt_time(rec['decided_at'])}"
+                            + (f" — “{esc(rec['note'])}”" if rec["note"] else ""))
 
     st.subheader("Audit trail")
     scope = st.radio("Scope", ["This incident", "Everything"], horizontal=True, label_visibility="collapsed")

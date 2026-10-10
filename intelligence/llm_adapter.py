@@ -34,6 +34,7 @@ _MUTATING_COMMAND = re.compile(
     r"(?i)\b(kubectl\s+(apply|delete|patch|scale|rollout|edit|replace|drain|cordon|exec|run|create)"
     r"|terraform\s+(apply|destroy|import)|docker\s+(rm|kill|stop|restart|run|exec|system\s+prune)"
     r"|helm\s+(install|upgrade|rollback|uninstall|delete)|rm\s+-rf|shutdown\b|curl\s+[^|]*\|\s*(sh|bash))")
+_LINK_OR_MARKUP = re.compile(r"(?i)(https?://|www\.|\]\(|!\[|<\s*/?\s*[a-z])")
 _NUMBER_WITH_UNIT = re.compile(r"(?<![\w.])(\d+(?:\.\d+)?)\s?(%|ms\b|s\b|MiB\b|MB\b)")
 _ANY_NUMBER = re.compile(r"(?<![\w.])\d+(?:\.\d+)?")
 
@@ -62,7 +63,8 @@ def build_payload(evidence: IncidentEvidence, result: AnalysisResult, hypotheses
         },
         "other_hypotheses": [{"category": h.category, "title": h.title, "score": h.score}
                              for h in hypotheses if h.category != result.root_cause_category and h.score > 0],
-        "evidence": [{"id": i.id, "source": i.source, "observation": i.observation,
+        # Observations are built from backend data as well, so they pass the same filter.
+        "evidence": [{"id": i.id, "source": i.source, "observation": neutralize_for_llm(i.observation, 600),
                       "untrusted_text": [neutralize_for_llm(t) for t in i.untrusted_text]}
                      for i in evidence.items()],
         "missing_information": result.missing_information,
@@ -159,6 +161,8 @@ def validate_llm_output(raw: str, evidence: IncidentEvidence, result: AnalysisRe
         reasons.append("claims certainty that the evidence cannot support")
     if _MUTATING_COMMAND.search(joined):
         reasons.append("contains a state-changing command; recommendations must be advisory text")
+    if _LINK_OR_MARKUP.search(joined):
+        reasons.append("contains a link or markup; the narrative must be plain text")
     if any(looks_like_injection(t) for t in texts):
         reasons.append("repeats instruction-like text; possible prompt injection carried over from telemetry")
     allowed = _grounded_numbers(evidence)
